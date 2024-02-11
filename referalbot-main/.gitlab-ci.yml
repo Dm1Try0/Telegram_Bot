@@ -1,0 +1,68 @@
+stages:
+    - build
+    - push
+    - deploy
+    - clear
+
+variables:
+  DOCKER_HOST: tcp://host.docker.internal:2375/
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+
+Dotnet build:
+    stage: build
+    image: mcr.microsoft.com/dotnet/sdk:latest
+    script:
+        - dotnet build
+
+Docker build:
+  stage: build
+  image: docker:latest
+  needs:
+    - Dotnet build
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA -f ./Ref.Bot.Api/Dockerfile .
+
+Push develop:
+  stage: push
+  image: docker:latest
+  only:
+    - main
+  needs:
+    - Docker build
+  before_script:
+    - docker login -u $LOGIN -p $PASSWORD $CI_REGISTRY
+  script:
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:alpha-latest
+    - docker push $CI_REGISTRY_IMAGE:alpha-latest
+    - docker image rm $CI_REGISTRY_IMAGE:alpha-latest
+
+Deploy develop:
+  stage: deploy
+  image: docker:latest
+  only:
+    - main
+  needs:
+    - Push develop
+  before_script:
+    - docker login -u $LOGIN -p $PASSWORD $CI_REGISTRY
+    - 'command -v ssh-agent >/dev/null || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - echo "$DEV_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $DEV_STAGE_HOST >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    - ssh $DEV_SSH_USER@$DEV_STAGE_HOST "docker login -u $LOGIN -p $PASSWORD $CI_REGISTRY"
+  script:
+    - ssh $DEV_SSH_USER@$DEV_STAGE_HOST "docker container stop $DEV_CONTAINER_NAME || true"
+    - ssh $DEV_SSH_USER@$DEV_STAGE_HOST "docker container rm $DEV_CONTAINER_NAME || true"
+    - ssh $DEV_SSH_USER@$DEV_STAGE_HOST "docker image rm $CI_REGISTRY_IMAGE:alpha-latest || true"
+    - ssh $DEV_SSH_USER@$DEV_STAGE_HOST "docker pull $CI_REGISTRY_IMAGE:alpha-latest"
+    - ssh $DEV_SSH_USER@$DEV_STAGE_HOST "docker run -d --restart=always -p $DEV_CONTAINER_PORT:80 --name $DEV_CONTAINER_NAME -e \"ConnectionStrings:default\"=\"$DEV_CONNECTIONSTRING\" -e \"telegramToken\"=\"$DEV_TELEGRAMTOKEN\" $CI_REGISTRY_IMAGE:alpha-latest"
+
+Docker Clear:
+  stage: clear
+  image: docker:latest
+  script:
+    - docker image rm $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
